@@ -1,0 +1,10 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build f1db",
+            "type": "shell",
+            "command": "./scripts/build_f1db"
+        }
+    ]
+}
