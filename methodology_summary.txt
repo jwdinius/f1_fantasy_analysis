@@ -1,0 +1,44 @@
+# F1 Fantasy Analysis: Methodology and Assumptions (Updated)
+
+## 1. Data Processing
+
+### Methods
+- **Source of Truth:** Uses the local SQLite database (`f1db.db`) race entry and results tables to identify all participating drivers and constructors for every round.
+- **Extended History:** Analysis spans from **2020 to 2025**, utilizing five years of historical performance data.
+- **Telemetry Integration:** Fetches high-fidelity lap-timing data for all sessions (FP1, FP2, FP3, Qualifying, Race, and Pre-season Testing) via the FastF1 API.
+- **Feature Engineering:** 
+    - **Median Gap:** The driver's median gap to the fastest lap of the session (reduces outlier impact).
+    - **IQR:** Interquartile range of lap times to measure pace consistency without the sensitivity of standard deviation.
+    - **Pit Stop Averages:** Average pit stop duration per round for each constructor.
+    - **DotD History:** Rolling count of "Driver of the Day" wins over the previous 5 races.
+- **Canonical Rebranding:** Standardizes all historical team identities to 2025 IDs (e.g., `racing-bulls`, `kick-sauber`, `aston-martin`) to ensure longitudinal model consistency.
+
+### Assumptions
+- **Participation:** A driver/constructor is assumed to be competing in a round only if they have a non-zero, non-NaN cost in the official fantasy tables.
+- **Testing Representation:** Day 3 of the first Pre-season Test is used as the proxy for early-season performance.
+- **Missing Data:** Missing practice sessions are handled as NaNs, allowing the XGBoost algorithm to decide the best path for missing values.
+
+## 2. Model Training
+
+### Methods
+- **Algorithm:** Utilizes an **XGBoost Regressor** to capture non-linear relationships and handle missing values natively.
+- **Feature Set:** Includes historical points lags (N=3), current round practice pace (Median & IQR), historical race-day pace variance, pit stop consistency, and DotD momentum.
+- **Temporal Validation:** Implements a strict "walk-forward" training strategy to prevent data leakage.
+
+### Assumptions
+- **Pace Predictivity:** Median gaps in practice sessions are assumed to be strong indicators of race-trim performance.
+- **Standardized Performance:** Assumes that team rebranded performance (e.g., AlphaTauri to Racing Bulls) carries over as a continuous historical indicator.
+
+## 3. Prediction and Optimization
+
+### Methods
+- **Expected Value (EV) Generation:** Produces a sorted "menu" of predicted points for every active asset.
+- **Top-N Combinatorial Optimization:** Solves the Knapsack problem to find the Top 5 team configurations meeting the budget.
+- **Constraint Enforcement:** 
+    - Exactly 5 Drivers and 2 Constructors.
+    - Strict adherence to the budget cap.
+    - **3-Asset Rule:** Max 3 assets from any single constructor (Constructor asset + 2 Drivers).
+
+### Assumptions
+- **Cost Realism:** Assumes total team cost must be composed of real, valid numbers from the source data.
+- **Asset Independence:** Predicted points are treated as independent variables for the purpose of optimization.

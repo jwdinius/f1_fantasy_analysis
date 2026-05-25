@@ -1,167 +1,218 @@
 import pandas as pd
 import numpy as np
 import xgboost as xgb
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error
 import itertools
 
-# 2025 Driver-Constructor Mapping
+# 2025 Canonical Constructor Mapping
 DRIVER_TO_CONSTRUCTOR = {
     'lando-norris': 'mclaren',
-    'max-verstappen': 'red-bull',
-    'george-russell': 'mercedes',
-    'andrea-kimi-antonelli': 'mercedes',
-    'alexander-albon': 'williams',
-    'lance-stroll': 'aston-martin',
-    'nico-hulkenberg': 'sauber',
-    'charles-leclerc': 'ferrari',
     'oscar-piastri': 'mclaren',
+    'max-verstappen': 'red-bull',
+    'liam-lawson': 'red-bull',
+    'george-russell': 'mercedes',
+    'kimi-antonelli': 'mercedes',
+    'charles-leclerc': 'ferrari',
     'lewis-hamilton': 'ferrari',
+    'alexander-albon': 'williams',
+    'carlos-sainz-jr': 'williams',
+    'fernando-alonso': 'aston-martin',
+    'lance-stroll': 'aston-martin',
     'pierre-gasly': 'alpine',
-    'yuki-tsunoda': 'rb',
+    'jack-doohan': 'alpine',
+    'yuki-tsunoda': 'racing-bulls',
+    'isack-hadjar': 'racing-bulls',
     'esteban-ocon': 'haas',
     'oliver-bearman': 'haas',
-    'liam-lawson': 'red-bull',
-    'gabriel-bortoleto': 'sauber',
-    'fernando-alonso': 'aston-martin',
-    'carlos-sainz-jr': 'williams',
-    'jack-doohan': 'alpine',
-    'isack-hadjar': 'rb'
+    'nico-hulkenberg': 'kick-sauber',
+    'gabriel-bortoleto': 'kick-sauber'
 }
 
+_DRIVER_CURRENT_ROUND_FEATURES = [
+    'fp1_gap_sec', 'fp2_gap_sec', 'fp3_gap_sec',
+    'lap_time_median_gap_fp1', 'lap_time_iqr_fp1',
+    'lap_time_median_gap_fp2', 'lap_time_iqr_fp2',
+    'lap_time_median_gap_fp3', 'lap_time_iqr_fp3',
+    'cost',
+]
+
+_CONSTRUCTOR_CURRENT_ROUND_FEATURES = [
+    'drivers_predicted_points_sum',
+    'cost',
+]
+
+
 class F1FantasyPredictor:
-    def __init__(self, n_lags=3):
-        self.n_lags = n_lags
-        self.model = xgb.XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=5, random_state=42)
+    def __init__(self, asset_type='driver'):
+        self.asset_type = asset_type
+        self.model = xgb.XGBRegressor(
+            n_estimators=300,
+            learning_rate=0.05,
+            max_depth=3,
+            min_child_weight=5,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_lambda=5,
+            random_state=42,
+        )
         self.is_trained = False
         self.feature_cols = []
+        self.evals_result_ = {}
 
     def prepare_features(self, df):
-        df = df.sort_values(['asset_id', 'year', 'round'])
-        
-        # Lagged features (historical performance)
-        for i in range(1, self.n_lags + 1):
-            df[f'points_lag_{i}'] = df.groupby('asset_id')['points'].shift(i)
-        
-        # Current round features (Practice & Testing)
-        # These are available BEFORE the race, so they are not lagged
-        # lap_time_median_gap_fp1, lap_time_median_gap_fp2, lap_time_median_gap_fp3, lap_time_median_gap_test
-        current_round_features = [
-            'lap_time_median_gap_fp1', 'lap_time_std_fp1',
-            'lap_time_median_gap_fp2', 'lap_time_std_fp2',
-            'lap_time_median_gap_fp3', 'lap_time_std_fp3',
-            'lap_time_median_gap_test', 'lap_time_std_test'
-        ]
-        
-        # Also include historical race pace (lagged)
-        for i in range(1, self.n_lags + 1):
-            if 'lap_time_median_gap_r' in df.columns:
-                df[f'race_gap_lag_{i}'] = df.groupby('asset_id')['lap_time_median_gap_r'].shift(i)
-                df[f'race_std_lag_{i}'] = df.groupby('asset_id')['lap_time_std_r'].shift(i)
-        
-        df['is_driver'] = (df['asset_type'] == 'driver').astype(int)
+        rolling_cols = [c for c in df.columns if '_rolling_' in c]
+        if self.asset_type == 'driver':
+            base_cols = [c for c in _DRIVER_CURRENT_ROUND_FEATURES if c in df.columns]
+        else:
+            base_cols = [c for c in _CONSTRUCTOR_CURRENT_ROUND_FEATURES if c in df.columns]
+        self.feature_cols = base_cols + rolling_cols
+        if not self.feature_cols:
+            print(f"WARNING: No features found for {self.asset_type}! Columns: {df.columns.tolist()}")
         return df
 
-    def train(self, df):
-        featured_df = self.prepare_features(df)
-        
-        lag_cols = [f'points_lag_{i}' for i in range(1, self.n_lags + 1)]
-        current_cols = [
-            'lap_time_median_gap_fp1', 'lap_time_std_fp1',
-            'lap_time_median_gap_fp2', 'lap_time_std_fp2',
-            'lap_time_median_gap_fp3', 'lap_time_std_fp3',
-            'lap_time_median_gap_test', 'lap_time_std_test'
-        ]
-        # Filter current_cols to only those that exist in df
-        current_cols = [c for c in current_cols if c in featured_df.columns]
-        
-        race_lag_cols = []
-        for i in range(1, self.n_lags + 1):
-            if f'race_gap_lag_{i}' in featured_df.columns:
-                race_lag_cols.append(f'race_gap_lag_{i}')
-                race_lag_cols.append(f'race_std_lag_{i}')
-            
-        self.feature_cols = lag_cols + current_cols + race_lag_cols + ['cost', 'is_driver']
-        
-        # We need at least points to train
-        train_df = featured_df.dropna(subset=['points'])
-        # Fill NaNs in features with a neutral value (e.g., 0 or mean)
-        # For XGBoost, it handles NaNs, but sometimes explicit filling is better
-        X = train_df[self.feature_cols].fillna(0)
-        y = train_df['points']
-        
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-        self.model.fit(X_train, y_train)
-        self.is_trained = True
-        preds = self.model.predict(X_test)
-        mse = mean_squared_error(y_test, preds)
-        print(f"Model trained with XGBoost. Features: {len(self.feature_cols)}. Test RMSE: {np.sqrt(mse):.2f}")
-        
-    def predict_next(self, df, year, round_num):
-        featured_df = self.prepare_features(df)
-        assets = featured_df['asset_id'].unique()
-        predictions = []
-        
-        for asset in assets:
-            asset_data = featured_df[featured_df['asset_id'] == asset].sort_values(['year', 'round'])
-            current_race = asset_data[(asset_data['year'] == year) & (asset_data['round'] == round_num)]
-            if current_race.empty: continue
-            
-            # Use pre-prepared features from featured_df for the specific row
-            X_curr = current_race[self.feature_cols].fillna(0)
-            pred_points = self.model.predict(X_curr)[0]
-            
-            predictions.append({
-                'asset_id': asset, 
-                'asset_type': current_race['asset_type'].iloc[0], 
-                'predicted_points': pred_points, 
-                'cost': current_race['cost'].iloc[0]
-            })
-            
-        return pd.DataFrame(predictions)
+    def train(self, df, val_df=None, sample_weight=None):
+        df = self.prepare_features(df)
+        train_df = df.dropna(subset=['fantasy_points'])
+        if train_df.empty or not self.feature_cols:
+            print(f"WARNING: Nothing to train for {self.asset_type}.")
+            return
+        X = train_df[self.feature_cols].fillna(-1)
+        y = train_df['fantasy_points']
 
-def optimize_team(predictions, budget=100.0):
+        # Align sample weights to the rows that survived dropna
+        sw = None
+        if sample_weight is not None:
+            sw = sample_weight[train_df.index]
+
+        if val_df is not None:
+            val_df = self.prepare_features(val_df)
+            val_clean = val_df.dropna(subset=['fantasy_points'])
+            X_val = val_clean[self.feature_cols].fillna(-1)
+            y_val = val_clean['fantasy_points']
+            # XGBoost 3.x requires early_stopping_rounds in the constructor,
+            # so swap in a fresh instance for this path only.
+            self.model = xgb.XGBRegressor(
+                n_estimators=300,
+                learning_rate=0.05,
+                max_depth=3,
+                min_child_weight=5,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                reg_lambda=5,
+                random_state=42,
+                early_stopping_rounds=30,
+            )
+            self.model.fit(
+                X, y,
+                sample_weight=sw,
+                eval_set=[(X, y), (X_val, y_val)],
+                verbose=False,
+            )
+            self.evals_result_ = self.model.evals_result_
+        else:
+            self.model.fit(X, y, sample_weight=sw)
+
+        self.is_trained = True
+        best = getattr(self.model, 'best_iteration', None)
+        suffix = f", best round {best}" if best is not None else ""
+        print(f"Model ({self.asset_type}) trained on {len(X)} rows, "
+              f"{len(self.feature_cols)} features{suffix}.")
+
+    def save(self, path):
+        import joblib
+        joblib.dump(self, path)
+        print(f"Saved {self.asset_type} predictor → {path}")
+
+    @classmethod
+    def load(cls, path):
+        import joblib
+        return joblib.load(path)
+
+    def predict_next(self, df, year, round_num, drivers_predicted_sum_map=None):
+        current_round = df[(df['year'] == year) & (df['round'] == round_num)].copy()
+        if current_round.empty:
+            return pd.DataFrame()
+        if self.asset_type == 'constructor' and drivers_predicted_sum_map is not None:
+            current_round['drivers_predicted_points_sum'] = (
+                current_round['constructor_id'].map(drivers_predicted_sum_map).fillna(0)
+            )
+        # feature_cols are locked in by train(); only derive here if never trained
+        if not self.feature_cols:
+            self.prepare_features(current_round)
+        X_curr = current_round[self.feature_cols].fillna(-1)
+        preds = self.model.predict(X_curr) if self.is_trained else np.zeros(len(X_curr))
+
+        if self.asset_type == 'driver':
+            results = current_round[['driver_id', 'constructor_id', 'cost']].copy()
+            results = results.rename(columns={'driver_id': 'asset_id'})
+            results['asset_type'] = 'driver'
+        else:
+            results = current_round[['constructor_id', 'cost']].copy()
+            results = results.rename(columns={'constructor_id': 'asset_id'})
+            results['asset_type'] = 'constructor'
+            results['constructor_id'] = results['asset_id']
+
+        results['predicted_points'] = preds
+        return results
+
+
+def optimize_team(predictions, budget=100.0, top_n=1):
     drivers = predictions[predictions['asset_type'] == 'driver'].to_dict('records')
     constructors = predictions[predictions['asset_type'] == 'constructor'].to_dict('records')
-    
-    best_team = None
-    best_score = -1
-    
+    drivers = [d for d in drivers if not pd.isna(d['cost']) and d['cost'] > 0]
+    constructors = [c for c in constructors if not pd.isna(c['cost']) and c['cost'] > 0]
+    if len(drivers) < 5 or len(constructors) < 2:
+        return None
+    all_teams = []
     for d_comb in itertools.combinations(drivers, 5):
         d_cost = sum(d['cost'] for d in d_comb)
-        if d_cost > budget: continue
-        
+        if d_cost > budget:
+            continue
         for c_comb in itertools.combinations(constructors, 2):
             total_cost = d_cost + sum(c['cost'] for c in c_comb)
             if total_cost <= budget:
-                # 3-asset rule: check each constructor count
                 counts = {}
-                # Drivers
                 for d in d_comb:
                     cons = DRIVER_TO_CONSTRUCTOR.get(d['asset_id'], 'unknown')
                     counts[cons] = counts.get(cons, 0) + 1
-                # Constructors themselves count as 1 asset for that team
                 for c in c_comb:
                     counts[c['asset_id']] = counts.get(c['asset_id'], 0) + 1
-                
                 if any(v > 3 for v in counts.values()):
                     continue
-                
-                total_points = sum(d['predicted_points'] for d in d_comb) + sum(c['predicted_points'] for c in c_comb)
-                if total_points > best_score:
-                    best_score = total_points
-                    best_team = {'drivers': d_comb, 'constructors': c_comb, 'total_cost': total_cost, 'predicted_points': total_points}
-            
-    return best_team
+                total_points = (
+                    sum(d['predicted_points'] for d in d_comb)
+                    + sum(c['predicted_points'] for c in c_comb)
+                )
+                all_teams.append({
+                    'drivers': [d['asset_id'] for d in d_comb],
+                    'constructors': [c['asset_id'] for c in c_comb],
+                    'total_cost': total_cost,
+                    'predicted_points': total_points,
+                })
+    all_teams.sort(key=lambda x: x['predicted_points'], reverse=True)
+    if not all_teams:
+        return None
+    return all_teams[:top_n] if top_n > 1 else all_teams[0]
+
 
 if __name__ == "__main__":
-    df = pd.read_csv("data/processed_fantasy.csv")
-    print("\n--- Final Recommendation (N=3) ---")
-    predictor = F1FantasyPredictor(n_lags=3)
-    predictor.train(df)
-    preds = predictor.predict_next(df, 2025, 1)
-    team = optimize_team(preds)
+    d_df = pd.read_csv("data/processed_fantasy_drivers.csv")
+    c_df = pd.read_csv("data/processed_fantasy_constructors.csv")
+    d_predictor = F1FantasyPredictor(asset_type='driver')
+    d_predictor.train(d_df)
+    d_preds = d_predictor.predict_next(d_df, 2025, 1)
+    driver_sums = d_preds.groupby('constructor_id')['predicted_points'].sum().to_dict()
+    c_predictor = F1FantasyPredictor(asset_type='constructor')
+    actual_sums = (
+        d_df.groupby(['year', 'round', 'constructor_id'])['fantasy_points']
+        .sum().reset_index()
+        .rename(columns={'fantasy_points': 'drivers_predicted_points_sum'})
+    )
+    c_df = pd.merge(c_df, actual_sums, on=['year', 'round', 'constructor_id'], how='left')
+    c_predictor.train(c_df)
+    c_preds = c_predictor.predict_next(c_df, 2025, 1, drivers_predicted_sum_map=driver_sums)
+    all_preds = pd.concat([d_preds, c_preds])
+    team = optimize_team(all_preds)
     if team:
-        print(f"Optimal Team (Budget: ${team['total_cost']:.1f}M, Predicted Points: {team['predicted_points']:.1f}):")
-        print("Drivers:", [d['asset_id'] for d in team['drivers']])
-        print("Constructors:", [c['asset_id'] for c in team['constructors']])
+        print(f"\nOptimal Team (Budget: ${team['total_cost']:.1f}M, Expected Points: {team['predicted_points']:.1f})")
+        print("Drivers:", team['drivers'])
+        print("Constructors:", team['constructors'])

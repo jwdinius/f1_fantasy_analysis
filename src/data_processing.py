@@ -1,330 +1,565 @@
-import pandas as pd
-import numpy as np
+"""
+F1 Fantasy Analysis — Data Processing Pipeline
+
+Produces:
+  data/processed_fantasy_drivers.csv
+  data/processed_fantasy_constructors.csv
+
+Each row is one (asset, round) pair with:
+  - fantasy_points: target variable (2025 scoring rules applied uniformly)
+  - Current-round features: f1db Practice Gaps + FastF1 median gap / IQR
+  - Training Window features: rolling aggregates over N prior rounds
+    - Continuous (race_pos, quali_pos, pos_gained, fantasy_points,
+                  fastest_pit_stop): median, min, max
+    - Binary (dotd, fastest_lap, both_q3, one_q3, both_q2): sum
+
+DNF/DSQ race positions are imputed with DNF_DSQ_IMPUTE (25) before rolling.
+Training Window width is configurable via --window (default 3).
+"""
+
+import argparse
 from pathlib import Path
+
 import fastf1
-import sys
+import numpy as np
+import pandas as pd
+
 from src.database import F1DataManager
 from src.scoring import F1FantasyScorer2025
 
-# Enable fastf1 cache
-cache_dir = Path(".fastf1")
-cache_dir.mkdir(exist_ok=True)
-fastf1.Cache.enable_cache(cache_dir)
+# ---------------------------------------------------------------------------
+# FastF1 cache
+# ---------------------------------------------------------------------------
+_cache_dir = Path(".fastf1")
+_cache_dir.mkdir(exist_ok=True)
+fastf1.Cache.enable_cache(_cache_dir)
 
-def get_mapping(db):
-    # Driver mapping: last_name -> database_id
-    drivers = db.query("SELECT id, last_name FROM driver")
-    driver_map = {row['last_name']: row['id'] for _, row in drivers.iterrows()}
-    # Special cases for fantasy CSV naming
-    driver_map['Sargent'] = 'logan-sargeant'
-    driver_map['De Vries'] = 'nyck-de-vries'
-    driver_map['Hulkenberg'] = 'nico-hulkenberg'
-    driver_map['Tsunoda'] = 'yuki-tsunoda'
-    driver_map['Sainz'] = 'carlos-sainz-jr'
-    driver_map['Verstappen'] = 'max-verstappen'
-    driver_map['Perez'] = 'sergio-perez'
-    driver_map['Hamilton'] = 'lewis-hamilton'
-    driver_map['Russell'] = 'george-russell'
-    driver_map['Leclerc'] = 'charles-leclerc'
-    driver_map['Norris'] = 'lando-norris'
-    driver_map['Piastri'] = 'oscar-piastri'
-    driver_map['Alonso'] = 'fernando-alonso'
-    driver_map['Stroll'] = 'lance-stroll'
-    driver_map['Gasly'] = 'pierre-gasly'
-    driver_map['Ocon'] = 'esteban-ocon'
-    driver_map['Albon'] = 'alexander-albon'
-    driver_map['Bottas'] = 'valtteri-bottas'
-    driver_map['Zhou'] = 'guanyu-zhou'
-    driver_map['Magnussen'] = 'kevin-magnussen'
-    driver_map['Ricciardo'] = 'daniel-ricciardo'
-    driver_map['Lawson'] = 'liam-lawson'
-    driver_map['Bearman'] = 'oliver-bearman'
-    driver_map['Colapinto'] = 'franco-colapinto'
-    driver_map['Doohan'] = 'jack-doohan'
-    driver_map['Bortoleto'] = 'gabriel-bortoleto'
-    driver_map['Antonelli'] = 'andrea-kimi-antonelli'
-    driver_map['Hadjar'] = 'isack-hadjar'
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-    # Constructor mapping: name -> database_id
-    constructors = db.query("SELECT id, name FROM constructor")
-    cons_map = {row['name']: row['id'] for _, row in constructors.iterrows()}
-    # Special cases for fantasy naming
-    cons_map['Red Bull'] = 'red-bull'
-    cons_map['Mercedes'] = 'mercedes'
-    cons_map['Ferrari'] = 'ferrari'
-    cons_map['McLaren'] = 'mclaren'
-    cons_map['Aston Martin'] = 'aston-martin'
-    cons_map['Alpine'] = 'alpine'
-    cons_map['Williams'] = 'williams'
-    cons_map['RB'] = 'rb'
-    cons_map['Alpha Tauri'] = 'alphatauri'
-    cons_map['Haas'] = 'haas'
-    cons_map['Sauber'] = 'sauber'
-    cons_map['Alfa Romeo'] = 'alfa-romeo'
-    cons_map['Stake'] = 'sauber'
+CONSTRUCTOR_REBRANDING = {
+    'racing-point': 'aston-martin',
+    'alphatauri': 'racing-bulls',
+    'toro-rosso': 'racing-bulls',
+    'rb': 'racing-bulls',
+    'alfa-romeo': 'kick-sauber',
+    'sauber': 'kick-sauber',
+    'renault': 'alpine',
+}
 
-    return driver_map, cons_map
+# Imputed position for DNF / DSQ — above the 20-car grid, scores negatively
+DNF_DSQ_IMPUTE = 25
 
-def get_fastf1_driver_mapping(session):
-    """Maps FastF1 driver abbreviations to our database driver IDs."""
-    # This is a bit tricky as FastF1 uses abbreviations like 'VER', 'HAM'.
-    # We can try to match them using the session's driver info.
-    mapping = {}
-    for drv_code in session.laps['Driver'].unique():
-        try:
-            drv_info = session.get_driver(drv_code)
-            last_name = drv_info['LastName']
-            # Heuristic: match last name to our IDs
-            # This is not perfect but should work for most
-            # We'll use a hardcoded fallback for common mismatches
-            full_name_lower = f"{drv_info['FirstName']} {drv_info['LastName']}".lower().replace(" ", "-")
-            if 'verstappen' in full_name_lower: mapping[drv_code] = 'max-verstappen'
-            elif 'perez' in full_name_lower: mapping[drv_code] = 'sergio-perez'
-            elif 'hamilton' in full_name_lower: mapping[drv_code] = 'lewis-hamilton'
-            elif 'russell' in full_name_lower: mapping[drv_code] = 'george-russell'
-            elif 'leclerc' in full_name_lower: mapping[drv_code] = 'charles-leclerc'
-            elif 'sainz' in full_name_lower: mapping[drv_code] = 'carlos-sainz-jr'
-            elif 'norris' in full_name_lower: mapping[drv_code] = 'lando-norris'
-            elif 'piastri' in full_name_lower: mapping[drv_code] = 'oscar-piastri'
-            elif 'alonso' in full_name_lower: mapping[drv_code] = 'fernando-alonso'
-            elif 'stroll' in full_name_lower: mapping[drv_code] = 'lance-stroll'
-            elif 'gasly' in full_name_lower: mapping[drv_code] = 'pierre-gasly'
-            elif 'ocon' in full_name_lower: mapping[drv_code] = 'esteban-ocon'
-            elif 'albon' in full_name_lower: mapping[drv_code] = 'alexander-albon'
-            elif 'sargeant' in full_name_lower: mapping[drv_code] = 'logan-sargeant'
-            elif 'tsunoda' in full_name_lower: mapping[drv_code] = 'yuki-tsunoda'
-            elif 'ricciardo' in full_name_lower: mapping[drv_code] = 'daniel-ricciardo'
-            elif 'bottas' in full_name_lower: mapping[drv_code] = 'valtteri-bottas'
-            elif 'zhou' in full_name_lower: mapping[drv_code] = 'guanyu-zhou'
-            elif 'magnussen' in full_name_lower: mapping[drv_code] = 'kevin-magnussen'
-            elif 'hulkenberg' in full_name_lower: mapping[drv_code] = 'nico-hulkenberg'
-            elif 'lawson' in full_name_lower: mapping[drv_code] = 'liam-lawson'
-            elif 'bearman' in full_name_lower: mapping[drv_code] = 'oliver-bearman'
-            elif 'colapinto' in full_name_lower: mapping[drv_code] = 'franco-colapinto'
-            elif 'doohan' in full_name_lower: mapping[drv_code] = 'jack-doohan'
-            elif 'bortoleto' in full_name_lower: mapping[drv_code] = 'gabriel-bortoleto'
-            elif 'antonelli' in full_name_lower: mapping[drv_code] = 'andrea-kimi-antonelli'
-            elif 'hadjar' in full_name_lower: mapping[drv_code] = 'isack-hadjar'
-            else:
-                mapping[drv_code] = full_name_lower
-        except:
-            continue
-    return mapping
+DEFAULT_WINDOW = 3
 
-def fetch_fastf1_stats(year, round_num, session_type='R'):
-    """
-    session_type: 'R' for Race, 'Q' for Qualifying, 'FP1', 'FP2', 'FP3'
-    For preseason testing, round_num is ignored if we use get_testing_session.
-    """
-    try:
-        if isinstance(round_num, str) and 'test' in round_num.lower():
-            # Handle preseason testing (simplified: just get Day 3 of Test 1)
-            session = fastf1.get_testing_session(year, 1, 3)
-        else:
-            session = fastf1.get_session(year, round_num, session_type)
-            
-        session.load(laps=True, telemetry=False, weather=False, messages=False)
-        laps = session.laps
-        if laps.empty: return pd.DataFrame()
-        
-        laps = laps.dropna(subset=['LapTime'])
-        if laps.empty: return pd.DataFrame()
-        
-        fastest_lap_session = laps['LapTime'].min().total_seconds()
-        driver_mapping = get_fastf1_driver_mapping(session)
-        
-        stats = []
-        for drv_code in laps['Driver'].unique():
-            drv_laps = laps[laps['Driver'] == drv_code]
-            lap_times = drv_laps['LapTime'].dt.total_seconds()
-            gaps = lap_times - fastest_lap_session
-            
-            suffix = f"_{session_type.lower()}" if not ('test' in str(round_num).lower()) else "_test"
-            stats.append({
-                'asset_id': driver_mapping.get(drv_code, drv_code),
-                f'lap_time_median_gap{suffix}': gaps.median(),
-                f'lap_time_std{suffix}': lap_times.std(),
-                f'lap_time_iqr{suffix}': lap_times.quantile(0.75) - lap_times.quantile(0.25)
-            })
-        
-        df_stats = pd.DataFrame(stats)
-        
-        # Aggregate for constructors
-        cons_stats = []
-        for drv_code in laps['Driver'].unique():
-            try:
-                drv_info = session.get_driver(drv_code)
-                team_name = drv_info['TeamName']
-                cons_id = team_name.lower().replace(" ", "-")
-                if 'red-bull' in cons_id: cons_id = 'red-bull'
-                elif 'rb' == cons_id: cons_id = 'rb'
-                
-                drv_id = driver_mapping.get(drv_code, drv_code)
-                drv_row = df_stats[df_stats['asset_id'] == drv_id]
-                if not drv_row.empty:
-                    suffix = f"_{session_type.lower()}" if not ('test' in str(round_num).lower()) else "_test"
-                    cons_stats.append({
-                        'asset_id': cons_id,
-                        f'lap_time_median_gap{suffix}': drv_row[f'lap_time_median_gap{suffix}'].iloc[0],
-                        f'lap_time_std{suffix}': drv_row[f'lap_time_std{suffix}'].iloc[0],
-                        f'lap_time_iqr{suffix}': drv_row[f'lap_time_iqr{suffix}'].iloc[0]
-                    })
-            except: continue
-        
-        if cons_stats:
-            df_cons_stats = pd.DataFrame(cons_stats).groupby('asset_id').mean().reset_index()
-            df_cons_stats['asset_type'] = 'constructor'
-            df_stats['asset_type'] = 'driver'
-            return pd.concat([df_stats, df_cons_stats])
-        return df_stats
-    except Exception as e:
-        print(f"  Error fetching FastF1 {session_type} for {year} R{round_num}: {e}")
-        sys.stdout.flush()
-        return pd.DataFrame()
+DRIVER_CONTINUOUS_COLS = ['race_pos', 'quali_pos', 'pos_gained', 'fantasy_points']
+DRIVER_BINARY_COLS = ['dotd', 'fastest_lap']
+CONSTRUCTOR_CONTINUOUS_COLS = ['fastest_pit_stop']
+CONSTRUCTOR_BINARY_COLS = ['both_q3', 'one_q3', 'both_q2']
 
-def load_costs(year, driver_map, cons_map):
-    base_path = Path("data/fantasy_csv")
-    d_cost_file = base_path / f"Drivers-Cost-{year}.csv"
-    c_cost_file = base_path / f"Teams-Cost-{year}.csv"
-    
-    if not d_cost_file.exists() or not c_cost_file.exists():
-        return pd.DataFrame()
+# Cost CSV team-name → canonical constructor_id (after rebranding)
+CONSTRUCTOR_COST_MAP = {
+    'Red Bull': 'red-bull',
+    'McLaren': 'mclaren',
+    'Ferrari': 'ferrari',
+    'Mercedes': 'mercedes',
+    'Aston Martin': 'aston-martin',
+    'Alpine': 'alpine',
+    'Williams': 'williams',
+    'AlphaTauri': 'racing-bulls',
+    'RB': 'racing-bulls',
+    'Racing Bulls': 'racing-bulls',
+    'Alfa Romeo': 'kick-sauber',
+    'Kick Sauber': 'kick-sauber',
+    'Haas': 'haas',
+    'Haas F1 Team': 'haas',
+}
 
-    d_df = pd.read_csv(d_cost_file, index_col=0)
-    c_df = pd.read_csv(c_cost_file, index_col=0)
-    
-    # Remove 'Average' column if exists
-    if 'Average' in d_df.columns: d_df = d_df.drop(columns=['Average'])
-    if 'Average' in c_df.columns: c_df = c_df.drop(columns=['Average'])
-    
-    # Map rows to IDs
-    d_df.index = d_df.index.map(lambda x: driver_map.get(x, x))
-    c_df.index = c_df.index.map(lambda x: cons_map.get(x, x))
-    
-    # Melt into long form
-    d_melted = d_df.reset_index().melt(id_vars='index', var_name='race_name', value_name='cost')
-    d_melted.rename(columns={'index': 'asset_id'}, inplace=True)
-    d_melted['asset_type'] = 'driver'
-    
-    c_melted = c_df.reset_index().melt(id_vars='index', var_name='race_name', value_name='cost')
-    c_melted.rename(columns={'index': 'asset_id'}, inplace=True)
-    c_melted['asset_type'] = 'constructor'
-    
-    df = pd.concat([d_melted, c_melted])
-    df['year'] = year
+# Overrides for driver last names that are ambiguous or differ from f1db
+LAST_NAME_OVERRIDES = {
+    'Hamilton': 'lewis-hamilton',
+    'Schumacher': 'mick-schumacher',
+    'Verstappen': 'max-verstappen',
+    'Sainz': 'carlos-sainz-jr',
+    'Zhou': 'guanyu-zhou',
+    'Magnussen': 'kevin-magnussen',
+    'Hulkenberg': 'nico-hulkenberg',
+}
+
+# ---------------------------------------------------------------------------
+# Cost loading
+# ---------------------------------------------------------------------------
+
+def _load_cost_csv(path: Path) -> pd.DataFrame:
+    """Read a cost CSV, dropping the trailing Average column if present."""
+    df = pd.read_csv(path, index_col=0)
+    if 'Average' in df.columns:
+        df = df.drop(columns=['Average'])
     return df
 
-def calculate_all_scores(db, year):
+
+def load_costs(year: int, db: F1DataManager):
+    """
+    Returns (driver_costs, constructor_costs) as dicts keyed by
+    (id, round_num) → cost in millions.
+
+    Cost data is only available from 2022 onwards; returns empty dicts
+    for earlier years.
+    """
+    project_root = Path(__file__).resolve().parent.parent
+    driver_cost_path = project_root / "data" / "fantasy_csv" / f"Drivers-Cost-{year}.csv"
+    team_cost_path = project_root / "data" / "fantasy_csv" / f"Teams-Cost-{year}.csv"
+
+    if not driver_cost_path.exists():
+        return {}, {}
+
+    rounds = db.query(
+        f"SELECT round FROM race WHERE year = {year} ORDER BY round"
+    )['round'].tolist()
+
+    drivers_df = db.query("SELECT id, last_name FROM driver")
+    last_name_to_id = {row['last_name']: row['id'] for _, row in drivers_df.iterrows()}
+    last_name_to_id.update(LAST_NAME_OVERRIDES)
+
+    driver_costs = {}
+    d_csv = _load_cost_csv(driver_cost_path)
+    num_rounds = min(len(d_csv.columns), len(rounds))
+    for name, row in d_csv.iterrows():
+        d_id = last_name_to_id.get(str(name).strip())
+        if not d_id:
+            continue
+        for col_idx in range(num_rounds):
+            val = row.iloc[col_idx]
+            if pd.notna(val):
+                driver_costs[(d_id, rounds[col_idx])] = float(val)
+
+    constructor_costs = {}
+    if team_cost_path.exists():
+        t_csv = _load_cost_csv(team_cost_path)
+        for name, row in t_csv.iterrows():
+            c_id = CONSTRUCTOR_COST_MAP.get(str(name).strip())
+            if not c_id:
+                continue
+            for col_idx in range(num_rounds):
+                val = row.iloc[col_idx]
+                if pd.notna(val):
+                    constructor_costs[(c_id, rounds[col_idx])] = float(val)
+
+    return driver_costs, constructor_costs
+
+
+# ---------------------------------------------------------------------------
+# FastF1 feature extraction
+# ---------------------------------------------------------------------------
+
+def fetch_fastf1_session_stats(year: int, round_num: int, session_type: str) -> pd.DataFrame:
+    """
+    Fetch per-driver median Practice Gap and IQR for one session.
+
+    Returns a DataFrame with columns:
+      driver_number (str), median_gap (sec), iqr (sec)
+
+    Returns an empty DataFrame on any failure (missing cache, old season, etc.).
+    session_type: 'FP1', 'FP2', or 'FP3'
+    """
+    try:
+        session = fastf1.get_session(year, round_num, session_type)
+        session.load(laps=True, telemetry=False, weather=False, messages=False)
+        laps = session.laps.dropna(subset=['LapTime'])
+        if laps.empty:
+            return pd.DataFrame()
+
+        fastest_lap_sec = laps['LapTime'].min().total_seconds()
+        stats = []
+        for drv_code in laps['Driver'].unique():
+            try:
+                drv_laps = laps[laps['Driver'] == drv_code]['LapTime'].dt.total_seconds()
+                drv_info = session.get_driver(drv_code)
+                d_num = str(int(drv_info['DriverNumber']))
+                stats.append({
+                    'driver_number': d_num,
+                    'median_gap': drv_laps.median() - fastest_lap_sec,
+                    'iqr': float(drv_laps.quantile(0.75) - drv_laps.quantile(0.25)),
+                })
+            except Exception:
+                continue
+        return pd.DataFrame(stats)
+    except Exception:
+        return pd.DataFrame()
+
+
+# ---------------------------------------------------------------------------
+# Raw data extraction + scoring
+# ---------------------------------------------------------------------------
+
+def _get_session_row(results_df: pd.DataFrame, driver_id: str):
+    """Return the first matching row as a Series, or None."""
+    rows = results_df[results_df['driver_id'] == driver_id]
+    return rows.iloc[0] if not rows.empty else None
+
+
+def _quali_bonus_flags(team_q_positions: list) -> tuple:
+    """
+    Return (both_q3, one_q3, both_q2) binary flags from a list of
+    qualifying position numbers.
+    """
+    valid = [p for p in team_q_positions if p is not None and pd.notna(p) and p > 0]
+    if not valid:
+        return 0, 0, 0
+    min_q = min(valid)
+    max_q = max(valid) if len(valid) > 1 else 99
+    both_q3 = 1 if min_q <= 10 and max_q <= 10 else 0
+    one_q3 = 1 if min_q <= 10 and max_q > 10 else 0
+    both_q2 = 1 if min_q > 10 and max_q <= 15 else 0
+    return both_q3, one_q3, both_q2
+
+
+def get_all_rows(db: F1DataManager, year: int) -> tuple:
+    """
+    Extract per-driver and per-constructor rows for all rounds in year.
+    Returns (driver_rows, constructor_rows) as lists of dicts.
+    FastF1 columns are set to NaN here and filled in by the caller.
+    """
     scorer = F1FantasyScorer2025()
     races = db.query(f"SELECT * FROM race WHERE year = {year} ORDER BY round")
-    all_scores = []
-    
+    driver_rows = []
+    constructor_rows = []
+
     for _, race in races.iterrows():
         race_id = race['id']
-        results = db.query(f"SELECT * FROM race_result WHERE race_id = {race_id}")
-        if results.empty: continue
-        
-        quali = db.query(f"SELECT * FROM qualifying_result WHERE race_id = {race_id}")
-        sprint = db.query(f"SELECT * FROM sprint_race_result WHERE race_id = {race_id}")
-        pit_stops = db.query(f"SELECT * FROM pit_stop WHERE race_id = {race_id}")
-        
-        dotd_row = results[results['driver_of_the_day'] == 1]
-        dotd_driver_id = dotd_row['driver_id'].iloc[0] if not dotd_row.empty else None
-        
-        fastest_overall_stop = pit_stops['time_millis'].min() if not pit_stops.empty else None
-        
-        driver_cons_contribs = {}
-        driver_dsq_status = {}
-        
-        for _, res in results.iterrows():
-            d_id = res['driver_id']
-            q_res = quali[quali['driver_id'] == d_id].iloc[0] if not quali[quali['driver_id'] == d_id].empty else None
-            s_res = sprint[sprint['driver_id'] == d_id].iloc[0] if not sprint[sprint['driver_id'] == d_id].empty else None
-            
-            total, contrib, is_dsq = scorer.calculate_driver_score(res, s_res, q_res, dotd_driver_id)
-            
-            driver_cons_contribs[d_id] = contrib
-            driver_dsq_status[d_id] = is_dsq
-            
-            all_scores.append({
-                'year': year, 'round': race['round'], 'asset_id': d_id, 'asset_type': 'driver', 'points': total
+        round_num = race['round']
+        print(f"  R{round_num}", end='... ', flush=True)
+
+        race_results = db.query(
+            f"SELECT * FROM race_result WHERE race_id = {race_id}"
+        )
+        if race_results.empty:
+            print("no results, skipping")
+            continue
+
+        quali_results = db.query(
+            f"SELECT * FROM qualifying_result WHERE race_id = {race_id}"
+        )
+        sprint_results = db.query(
+            f"SELECT * FROM sprint_race_result WHERE race_id = {race_id}"
+        )
+        fp1_results = db.query(
+            f"SELECT * FROM free_practice_1_result WHERE race_id = {race_id}"
+        )
+        fp2_results = db.query(
+            f"SELECT * FROM free_practice_2_result WHERE race_id = {race_id}"
+        )
+        fp3_results = db.query(
+            f"SELECT * FROM free_practice_3_result WHERE race_id = {race_id}"
+        )
+        pit_data = db.query(
+            f"SELECT * FROM race_data WHERE race_id = {race_id} AND type = 'PIT_STOP'"
+        )
+        dotd_data = db.query(
+            f"SELECT * FROM race_data WHERE race_id = {race_id}"
+            f" AND type = 'DRIVER_OF_THE_DAY_RESULT'"
+        )
+
+        # DotD winner (highest vote percentage)
+        dotd_driver_id = None
+        if not dotd_data.empty:
+            valid_dotd = dotd_data.dropna(subset=['driver_of_the_day_percentage'])
+            if not valid_dotd.empty:
+                dotd_driver_id = valid_dotd.loc[
+                    valid_dotd['driver_of_the_day_percentage'].idxmax(), 'driver_id'
+                ]
+
+        # Fastest pit stop time across all teams (for constructor bonus)
+        fastest_overall_millis = None
+        if not pit_data.empty:
+            times = pit_data['pit_stop_time_millis'].dropna()
+            if not times.empty:
+                fastest_overall_millis = times.min()
+
+        # --- Driver rows ---
+        driver_contribs: dict = {}
+        driver_dsq: dict = {}
+
+        for _, r in race_results.iterrows():
+            d_id = r['driver_id']
+            c_id = CONSTRUCTOR_REBRANDING.get(r['constructor_id'], r['constructor_id'])
+
+            q_res = _get_session_row(quali_results, d_id)
+            s_res = _get_session_row(sprint_results, d_id)
+
+            total, contrib, is_dsq = scorer.calculate_driver_score(
+                r, s_res, q_res, dotd_driver_id
+            )
+            driver_contribs[d_id] = contrib
+            driver_dsq[d_id] = is_dsq
+
+            # Practice Gaps from f1db (best lap vs session fastest, in seconds)
+            def _fp_gap(fp_df):
+                rows = fp_df[fp_df['driver_id'] == d_id]
+                if rows.empty:
+                    return np.nan
+                millis = rows.iloc[0]['gap_millis']
+                return millis / 1000.0 if pd.notna(millis) else np.nan
+
+            race_pos = r['position_number'] if pd.notna(r['position_number']) else np.nan
+            quali_pos = (
+                q_res['position_number']
+                if q_res is not None and pd.notna(q_res['position_number'])
+                else np.nan
+            )
+            pos_gained = r.get('positions_gained', 0)
+            pos_gained = float(pos_gained) if pd.notna(pos_gained) else 0.0
+
+            driver_rows.append({
+                'year': year,
+                'round': round_num,
+                'driver_id': d_id,
+                'constructor_id': c_id,
+                'driver_number': str(r['driver_number']),
+                'fantasy_points': float(total),
+                'race_pos': race_pos,
+                'quali_pos': quali_pos,
+                'pos_gained': pos_gained,
+                'dotd': 1 if d_id == dotd_driver_id else 0,
+                'fastest_lap': 1 if r.get('fastest_lap', 0) else 0,
+                'fp1_gap_sec': _fp_gap(fp1_results),
+                'fp2_gap_sec': _fp_gap(fp2_results),
+                'fp3_gap_sec': _fp_gap(fp3_results),
+                # FastF1 features — filled in after this loop
+                'lap_time_median_gap_fp1': np.nan,
+                'lap_time_iqr_fp1': np.nan,
+                'lap_time_median_gap_fp2': np.nan,
+                'lap_time_iqr_fp2': np.nan,
+                'lap_time_median_gap_fp3': np.nan,
+                'lap_time_iqr_fp3': np.nan,
+                'cost': np.nan,
             })
 
-        # Constructors
-        for c_id in results['constructor_id'].unique():
-            team_res = results[results['constructor_id'] == c_id]
-            team_drivers = team_res['driver_id'].tolist()
-            contrib_sum = sum(driver_cons_contribs.get(d, 0) for d in team_drivers)
-            dsq_list = [driver_dsq_status.get(d, False) for d in team_drivers]
-            team_q_pos = quali[quali['constructor_id'] == c_id]['position_number'].tolist()
-            team_pits = pit_stops[pit_stops['constructor_id'] == c_id]['time_millis'].tolist()
-            team_pits_sec = [t / 1000.0 for t in team_pits if not pd.isna(t)]
-            
-            is_fastest_team = False
-            if fastest_overall_stop and team_pits and min(team_pits) == fastest_overall_stop:
-                is_fastest_team = True
-                    
-            c_score = scorer.calculate_constructor_score(contrib_sum, team_q_pos, team_pits_sec, is_fastest_team, dsq_list)
-            
-            all_scores.append({
-                'year': year, 'round': race['round'], 'asset_id': c_id, 'asset_type': 'constructor', 'points': c_score
-            })
-            
-    return pd.DataFrame(all_scores)
+        # --- Constructor rows ---
+        for c_id_raw in race_results['constructor_id'].unique():
+            c_id = CONSTRUCTOR_REBRANDING.get(c_id_raw, c_id_raw)
+            team_driver_ids = race_results[
+                race_results['constructor_id'] == c_id_raw
+            ]['driver_id'].tolist()
 
-def main():
+            contrib_sum = sum(driver_contribs.get(d, 0) for d in team_driver_ids)
+            dsq_list = [driver_dsq.get(d, False) for d in team_driver_ids]
+
+            team_q = quali_results[quali_results['constructor_id'] == c_id_raw]
+            team_q_pos = team_q['position_number'].tolist()
+
+            team_pit_rows = pit_data[pit_data['constructor_id'] == c_id_raw]
+            team_pit_times = [
+                t / 1000.0
+                for t in team_pit_rows['pit_stop_time_millis'].dropna().tolist()
+            ]
+            fastest_pit = min(team_pit_times) if team_pit_times else np.nan
+
+            is_fastest_team = (
+                fastest_overall_millis is not None
+                and bool(team_pit_rows['pit_stop_time_millis'].dropna().tolist())
+                and team_pit_rows['pit_stop_time_millis'].dropna().min()
+                == fastest_overall_millis
+            )
+
+            c_score = scorer.calculate_constructor_score(
+                contrib_sum, team_q_pos, team_pit_times, is_fastest_team, dsq_list
+            )
+            both_q3, one_q3, both_q2 = _quali_bonus_flags(team_q_pos)
+
+            constructor_rows.append({
+                'year': year,
+                'round': round_num,
+                'constructor_id': c_id,
+                'fantasy_points': float(c_score),
+                'fastest_pit_stop': fastest_pit,
+                'both_q3': both_q3,
+                'one_q3': one_q3,
+                'both_q2': both_q2,
+                'cost': np.nan,
+            })
+
+        print("done")
+
+    return driver_rows, constructor_rows
+
+
+# ---------------------------------------------------------------------------
+# FastF1 enrichment (batch — called once per round after f1db extraction)
+# ---------------------------------------------------------------------------
+
+def enrich_with_fastf1(driver_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each (year, round) in driver_df, fetch FP1/FP2/FP3 stats from FastF1
+    and fill in lap_time_median_gap_fp* and lap_time_iqr_fp* columns.
+    Merges on driver_number.
+    """
+    for (year, round_num), group in driver_df.groupby(['year', 'round']):
+        for session_type, suffix in [('FP1', 'fp1'), ('FP2', 'fp2'), ('FP3', 'fp3')]:
+            stats = fetch_fastf1_session_stats(int(year), int(round_num), session_type)
+            if stats.empty:
+                continue
+            stats = stats.rename(columns={
+                'median_gap': f'lap_time_median_gap_{suffix}',
+                'iqr': f'lap_time_iqr_{suffix}',
+            })
+            mask = (driver_df['year'] == year) & (driver_df['round'] == round_num)
+            merged = driver_df.loc[mask].merge(
+                stats, on='driver_number', how='left', suffixes=('', '_ff1')
+            )
+            driver_df.loc[mask, f'lap_time_median_gap_{suffix}'] = merged[
+                f'lap_time_median_gap_{suffix}_ff1'
+            ].values
+            driver_df.loc[mask, f'lap_time_iqr_{suffix}'] = merged[
+                f'lap_time_iqr_{suffix}_ff1'
+            ].values
+    return driver_df
+
+
+# ---------------------------------------------------------------------------
+# Cost enrichment
+# ---------------------------------------------------------------------------
+
+def enrich_with_costs(driver_df: pd.DataFrame, constructor_df: pd.DataFrame,
+                      db: F1DataManager) -> tuple:
+    """Fill in the cost column for all rows, year by year."""
+    for year in driver_df['year'].unique():
+        d_costs, c_costs = load_costs(int(year), db)
+        for (d_id, rnd), cost in d_costs.items():
+            mask = (
+                (driver_df['year'] == year)
+                & (driver_df['round'] == rnd)
+                & (driver_df['driver_id'] == d_id)
+            )
+            driver_df.loc[mask, 'cost'] = cost
+        for (c_id, rnd), cost in c_costs.items():
+            mask = (
+                (constructor_df['year'] == year)
+                & (constructor_df['round'] == rnd)
+                & (constructor_df['constructor_id'] == c_id)
+            )
+            constructor_df.loc[mask, 'cost'] = cost
+    return driver_df, constructor_df
+
+
+# ---------------------------------------------------------------------------
+# Rolling window aggregates (Training Window features)
+# ---------------------------------------------------------------------------
+
+def add_rolling_features(df: pd.DataFrame, id_col: str,
+                          continuous_cols: list, binary_cols: list,
+                          window: int = DEFAULT_WINDOW) -> pd.DataFrame:
+    """
+    For each asset (identified by id_col), add rolling aggregates over the
+    N rounds immediately prior to each row.
+
+    Continuous columns → _rolling_median, _rolling_min, _rolling_max
+    Binary columns     → _rolling_sum
+
+    race_pos nulls (DNF/DSQ) are imputed with DNF_DSQ_IMPUTE before rolling.
+    pos_gained nulls are treated as 0 (no positions gained).
+    """
+    df = df.sort_values([id_col, 'year', 'round']).reset_index(drop=True)
+
+    for col in continuous_cols:
+        # Build the working series with imputation
+        work = df[col].copy()
+        if col == 'race_pos':
+            work = work.fillna(DNF_DSQ_IMPUTE)
+        elif col == 'pos_gained':
+            work = work.fillna(0.0)
+
+        df[col + '_work'] = work
+
+        for agg_name in ('median', 'min', 'max'):
+            out_col = f'{col}_rolling_{agg_name}'
+            df[out_col] = (
+                df.groupby(id_col)[col + '_work']
+                .transform(
+                    lambda x, a=agg_name: (
+                        x.shift(1).rolling(window, min_periods=1).agg(a)
+                    )
+                )
+            )
+
+        df.drop(columns=[col + '_work'], inplace=True)
+
+    for col in binary_cols:
+        df[f'{col}_rolling_sum'] = (
+            df.groupby(id_col)[col]
+            .transform(lambda x: x.shift(1).rolling(window, min_periods=1).sum())
+        )
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main(window: int = DEFAULT_WINDOW):
     db = F1DataManager()
-    d_map, c_map = get_mapping(db)
-    
-    all_data = []
-    # Note: 2025 might not have race data yet depending on when this is run
-    for year in [2023, 2024, 2025]:
-        print(f"Processing {year}...")
-        sys.stdout.flush()
-        costs = load_costs(year, d_map, c_map)
-        if costs.empty: continue
-        
-        points = calculate_all_scores(db, year)
-        
-        # Map race names to rounds for costs
-        races = db.query(f"SELECT round, official_name FROM race WHERE year = {year}")
-        unique_races_in_cost = costs['race_name'].unique()
-        race_to_round = {name: i+1 for i, name in enumerate(unique_races_in_cost)}
-        costs['round'] = costs['race_name'].map(race_to_round)
-        
-        merged = pd.merge(costs, points, on=['year', 'round', 'asset_id', 'asset_type'], how='left')
-        
-        # Preseason Testing (only once per year)
-        print(f"  Fetching Preseason Testing for {year}...")
-        sys.stdout.flush()
-        test_stats = fetch_fastf1_stats(year, 'test')
-        if not test_stats.empty:
-            test_stats['year'] = year
-            # Map testing to the first round for feature availability
-            test_stats['round'] = 1 
-            merged = pd.merge(merged, test_stats, on=['year', 'round', 'asset_id', 'asset_type'], how='left')
+    all_driver_rows = []
+    all_constructor_rows = []
 
-        # Practice & Race Stats per round
-        for round_num in merged['round'].unique():
-            if pd.isna(round_num): continue
-            r_num = int(round_num)
-            for s_type in ['FP1', 'FP2', 'FP3', 'R']:
-                print(f"  Fetching FastF1 {s_type} for {year} Round {r_num}...")
-                sys.stdout.flush()
-                stats = fetch_fastf1_stats(year, r_num, s_type)
-                if not stats.empty:
-                    stats['year'] = year
-                    stats['round'] = r_num
-                    # Avoid duplicate columns if we re-run or merge multiple times
-                    cols_to_use = [c for c in stats.columns if c not in merged.columns or c in ['year', 'round', 'asset_id', 'asset_type']]
-                    merged = pd.merge(merged, stats[cols_to_use], on=['year', 'round', 'asset_id', 'asset_type'], how='left')
-            
-        all_data.append(merged)
-        
-    final_df = pd.concat(all_data)
-    final_df.to_csv("data/processed_fantasy.csv", index=False)
-    print("Saved to data/processed_fantasy.csv")
-    sys.stdout.flush()
+    for year in range(2015, 2026):
+        print(f"\nProcessing {year}...")
+        try:
+            d_rows, c_rows = get_all_rows(db, year)
+            all_driver_rows.extend(d_rows)
+            all_constructor_rows.extend(c_rows)
+        except Exception as e:
+            print(f"  ERROR: {e}")
+            continue
+
+    if not all_driver_rows:
+        print("CRITICAL: No driver data collected.")
+        return
+
+    driver_df = pd.DataFrame(all_driver_rows)
+    constructor_df = pd.DataFrame(all_constructor_rows)
+
+    print("\nEnriching with costs...")
+    driver_df, constructor_df = enrich_with_costs(driver_df, constructor_df, db)
+
+    print("Enriching with FastF1 Practice Gap features...")
+    driver_df = enrich_with_fastf1(driver_df)
+
+    print(f"Computing Training Window rolling features (window={window})...")
+    driver_df = add_rolling_features(
+        driver_df, id_col='driver_id',
+        continuous_cols=DRIVER_CONTINUOUS_COLS,
+        binary_cols=DRIVER_BINARY_COLS,
+        window=window,
+    )
+    constructor_df = add_rolling_features(
+        constructor_df, id_col='constructor_id',
+        continuous_cols=CONSTRUCTOR_CONTINUOUS_COLS,
+        binary_cols=CONSTRUCTOR_BINARY_COLS,
+        window=window,
+    )
+
+    # Drop working columns used internally; keep only model-relevant columns
+    project_root = Path(__file__).resolve().parent.parent
+    out_dir = project_root / "data"
+
+    driver_out = out_dir / "processed_fantasy_drivers.csv"
+    constructor_out = out_dir / "processed_fantasy_constructors.csv"
+
+    driver_df.drop(columns=['driver_number'], inplace=True, errors='ignore')
+    driver_df.to_csv(driver_out, index=False)
+    constructor_df.to_csv(constructor_out, index=False)
+
+    print(f"\nSaved {len(driver_df)} driver rows → {driver_out}")
+    print(f"Saved {len(constructor_df)} constructor rows → {constructor_out}")
+
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="F1 Fantasy data processing pipeline")
+    parser.add_argument(
+        "--window", type=int, default=DEFAULT_WINDOW,
+        help=f"Training Window width in rounds (default: {DEFAULT_WINDOW})"
+    )
+    args = parser.parse_args()
+    main(window=args.window)

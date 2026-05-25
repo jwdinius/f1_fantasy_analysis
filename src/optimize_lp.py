@@ -2,7 +2,7 @@ import pandas as pd
 import itertools
 import sys
 
-# 2025 Driver-Constructor Mapping for the 3-asset rule
+# 2025 Canonical Constructor Mapping for the 3-asset rule
 DRIVER_TO_CONSTRUCTOR = {
     'lando-norris': 'mclaren',
     'oscar-piastri': 'mclaren',
@@ -18,12 +18,12 @@ DRIVER_TO_CONSTRUCTOR = {
     'lance-stroll': 'aston-martin',
     'pierre-gasly': 'alpine',
     'jack-doohan': 'alpine',
-    'yuki-tsunoda': 'rb',
-    'isack-hadjar': 'rb',
+    'yuki-tsunoda': 'racing-bulls',
+    'isack-hadjar': 'racing-bulls',
     'esteban-ocon': 'haas',
     'oliver-bearman': 'haas',
-    'nico-hulkenberg': 'sauber',
-    'gabriel-bortoleto': 'sauber'
+    'nico-hulkenberg': 'kick-sauber',
+    'gabriel-bortoleto': 'kick-sauber'
 }
 
 def solve_knapsack(ev_file, budget=100.0, cost_overrides=None, top_n=1):
@@ -89,21 +89,29 @@ def solve_knapsack(ev_file, budget=100.0, cost_overrides=None, top_n=1):
     return all_teams[:top_n] if top_n > 1 else (all_teams[0] if all_teams else None)
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python src/optimize_lp.py <ev_report_csv> [budget]")
+    import argparse
+    parser = argparse.ArgumentParser(description="F1 Fantasy team optimizer")
+    parser.add_argument("ev_report", help="Path to EV report CSV")
+    parser.add_argument("budget", nargs='?', type=float, default=100.0,
+                        help="Budget cap in millions (default: 100.0)")
+    parser.add_argument("--top-n", type=int, default=1,
+                        help="Number of top teams to display (default: 1)")
+    args = parser.parse_args()
+
+    results = solve_knapsack(args.ev_report, args.budget, top_n=args.top_n)
+
+    if not results:
+        print("No valid team found within budget.")
+    elif isinstance(results, list):
+        for i, team in enumerate(results, 1):
+            print(f"\n--- Team #{i} ---")
+            print(f"Budget Used: ${team['total_cost']:.1f}M / ${args.budget:.1f}M")
+            print(f"Expected Points: {team['predicted_points']:.2f}")
+            print(f"Drivers: {team['drivers']}")
+            print(f"Constructors: {team['constructors']}")
     else:
-        ev_file = sys.argv[1]
-        budget = float(sys.argv[2]) if len(sys.argv) > 2 else 100.0
-        
-        # Example cost override usage
-        # overrides = {'max-verstappen': 30.5}
-        
-        result = solve_knapsack(ev_file, budget)
-        if result:
-            print("--- Optimal F1 Fantasy Team ---")
-            print(f"Budget Used: ${result['total_cost']:.1f}M / ${budget:.1f}M")
-            print(f"Expected Points: {result['predicted_points']:.2f}")
-            print(f"Drivers: {result['drivers']}")
-            print(f"Constructors: {result['constructors']}")
-        else:
-            print("No valid team found within budget.")
+        print("--- Optimal F1 Fantasy Team ---")
+        print(f"Budget Used: ${results['total_cost']:.1f}M / ${args.budget:.1f}M")
+        print(f"Expected Points: {results['predicted_points']:.2f}")
+        print(f"Drivers: {results['drivers']}")
+        print(f"Constructors: {results['constructors']}")
