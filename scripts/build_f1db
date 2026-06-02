@@ -1,0 +1,23 @@
+#!/bin/bash
+
+# Define image name
+IMAGE_NAME="f1db"
+VERSION="$(date +%Y.%m.%d)"
+
+echo "Building Docker image: $IMAGE_NAME:$VERSION..."
+
+# Build the image
+# --rm removes intermediate containers after a successful build
+docker build -t $IMAGE_NAME:$VERSION --build-arg VERSION=$VERSION -f f1db/.devcontainer/Dockerfile --target builder f1db
+
+if [ $? -eq 0 ]; then
+    echo "✅ Build successful!"
+
+    echo "Copying artifacts to $(pwd)/data..."
+    CONTAINER_ID=$(docker create "$IMAGE_NAME:$VERSION")
+    docker cp "$CONTAINER_ID:/app/build/data" "$(pwd)"
+    docker rm -v "$CONTAINER_ID"
+else
+    echo "❌ Build failed!"
+    exit 1
+fi

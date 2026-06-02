@@ -1,0 +1,19 @@
+name: f1_fantasy
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip=26
+  - pandas               # Data manipulation
+  - py-xgboost           # XGBoost library
+  - numpy                # Numerical operations
+  - sqlalchemy           # Database ORM/Connection
+  - scikit-learn         # Feature extraction and prediction
+  - matplotlib           # Basic plotting
+  - seaborn              # Statistical data visualization
+  - jupyter              # Full Jupyter suite
+  - notebook             # Classic Jupyter Notebook
+  - ipykernel            # To use this env in VS Code notebooks
+  - pip:
+    - fastf1             # Essential for F1 telemetry and lap timing

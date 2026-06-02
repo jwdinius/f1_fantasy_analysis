@@ -1,0 +1,3 @@
+[submodule "f1db"]
+	path = f1db
+	url = git@github.com:jwdinius/f1db.git

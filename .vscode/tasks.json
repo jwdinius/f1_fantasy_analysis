@@ -1,0 +1,71 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        // ── Data pipeline ──────────────────────────────────────────────────
+        {
+            "label": "f1: Update f1db submodule",
+            "type": "shell",
+            "command": "git -C f1db fetch upstream && git -C f1db checkout add-docker && git -C f1db rebase upstream/main && git -C f1db push origin add-docker -f",
+            "presentation": { "reveal": "always", "panel": "shared", "group": "pipeline" }
+        },
+        {
+            "label": "f1: Build f1db",
+            "type": "shell",
+            "command": "./scripts/build_f1db",
+            "presentation": { "reveal": "always", "panel": "dedicated", "group": "pipeline" }
+        },
+        {
+            "label": "f1: Process Data",
+            "type": "shell",
+            "command": "conda run --no-capture-output -n f1_fantasy python -m src.data_processing",
+            "presentation": { "reveal": "always", "panel": "dedicated", "group": "pipeline" }
+        },
+        {
+            "label": "f1: Convert Numbers",
+            "type": "shell",
+            "command": "conda run --no-capture-output -n f1_fantasy python -m src.convert_numbers",
+            "presentation": { "reveal": "always", "panel": "dedicated", "group": "pipeline" }
+        },
+        // ── Prediction ─────────────────────────────────────────────────────
+        {
+            "label": "f1: Predict EV",
+            "type": "shell",
+            "command": "YEAR='${input:targetYear}'; ROUND='${input:targetRound}'; ARGS=''; [ -n \"$YEAR\" ] && ARGS=\"--year $YEAR\"; [ -n \"$ROUND\" ] && ARGS=\"$ARGS --round $ROUND\"; conda run --no-capture-output -n f1_fantasy python -m src.predict_ev $ARGS",
+            "presentation": { "reveal": "always", "panel": "dedicated", "group": "predict" }
+        },
+        {
+            "label": "f1: Optimize Team",
+            "type": "shell",
+            "command": "EV=$(ls -t '${workspaceFolder}/data/ev_reports/ev_report_'*.csv 2>/dev/null | head -1) && [ -n \"$EV\" ] && conda run --no-capture-output -n f1_fantasy python src/optimize_lp.py \"$EV\" 100.0 --top-n 5 || echo 'No EV report found — run f1: Predict EV first.'",
+            "presentation": { "reveal": "always", "panel": "dedicated", "group": "predict" }
+        },
+        {
+            "label": "f1: Predict EV + Optimize",
+            "type": "shell",
+            "command": "YEAR='${input:targetYear}'; ROUND='${input:targetRound}'; ARGS=''; [ -n \"$YEAR\" ] && ARGS=\"--year $YEAR\"; [ -n \"$ROUND\" ] && ARGS=\"$ARGS --round $ROUND\"; conda run --no-capture-output -n f1_fantasy python -m src.predict_ev $ARGS && EV=$(ls -t '${workspaceFolder}/data/ev_reports/ev_report_'*.csv 2>/dev/null | head -1) && conda run --no-capture-output -n f1_fantasy python src/optimize_lp.py \"$EV\" 100.0 --top-n 5",
+            "presentation": { "reveal": "always", "panel": "dedicated", "group": "predict" }
+        },
+        // ── Full race-weekend pipeline ──────────────────────────────────────
+        {
+            "label": "f1: Race Weekend — Full Pipeline",
+            "type": "shell",
+            "command": "YEAR='${input:targetYear}'; ROUND='${input:targetRound}'; ARGS=''; [ -n \"$YEAR\" ] && ARGS=\"--year $YEAR\"; [ -n \"$ROUND\" ] && ARGS=\"$ARGS --round $ROUND\"; ./scripts/race_weekend_update.sh $ARGS",
+            "group": { "kind": "build", "isDefault": true },
+            "presentation": { "reveal": "always", "panel": "dedicated" }
+        }
+    ],
+    "inputs": [
+        {
+            "id": "targetYear",
+            "type": "promptString",
+            "description": "Season year — leave blank to auto-detect",
+            "default": ""
+        },
+        {
+            "id": "targetRound",
+            "type": "promptString",
+            "description": "Round number — leave blank to auto-detect",
+            "default": ""
+        }
+    ]
+}
