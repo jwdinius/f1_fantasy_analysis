@@ -2,7 +2,7 @@
 
 # Define image name
 IMAGE_NAME="f1db"
-VERSION="26.0.0"
+VERSION="$(date +%Y.%m.%d)"
 
 echo "Building Docker image: $IMAGE_NAME:$VERSION..."
 

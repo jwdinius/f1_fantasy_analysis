@@ -57,8 +57,10 @@ TEAM_NAME_TO_ID = {
     'Alpha Tauri':  'racing-bulls',     # rebranded 2024
     'Alpine':       'alpine',
     'Aston Martin': 'aston-martin',
+    'Cadillac':     'cadillac',         # new team 2026
     'Ferrari':      'ferrari',
     'Haas':         'haas',
+    'Kick Sauber':  'kick-sauber',      # 2024–2025 branding
     'Mclaren':      'mclaren',          # capitalisation in source
     'Mercedes':     'mercedes',
     'Red Bull':     'red-bull',

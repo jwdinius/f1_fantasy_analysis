@@ -3,28 +3,31 @@ import numpy as np
 import xgboost as xgb
 import itertools
 
-# 2025 Canonical Constructor Mapping
+# 2026 Canonical Constructor Mapping
 DRIVER_TO_CONSTRUCTOR = {
-    'lando-norris': 'mclaren',
-    'oscar-piastri': 'mclaren',
-    'max-verstappen': 'red-bull',
-    'liam-lawson': 'red-bull',
-    'george-russell': 'mercedes',
-    'kimi-antonelli': 'mercedes',
-    'charles-leclerc': 'ferrari',
-    'lewis-hamilton': 'ferrari',
-    'alexander-albon': 'williams',
-    'carlos-sainz-jr': 'williams',
-    'fernando-alonso': 'aston-martin',
-    'lance-stroll': 'aston-martin',
-    'pierre-gasly': 'alpine',
-    'jack-doohan': 'alpine',
-    'yuki-tsunoda': 'racing-bulls',
-    'isack-hadjar': 'racing-bulls',
-    'esteban-ocon': 'haas',
-    'oliver-bearman': 'haas',
-    'nico-hulkenberg': 'kick-sauber',
-    'gabriel-bortoleto': 'kick-sauber'
+    'lando-norris':       'mclaren',
+    'oscar-piastri':      'mclaren',
+    'max-verstappen':     'red-bull',
+    'liam-lawson':        'red-bull',
+    'george-russell':     'mercedes',
+    'kimi-antonelli':     'mercedes',
+    'charles-leclerc':    'ferrari',
+    'lewis-hamilton':     'ferrari',
+    'alexander-albon':    'williams',
+    'carlos-sainz-jr':    'williams',
+    'fernando-alonso':    'aston-martin',
+    'lance-stroll':       'aston-martin',
+    'pierre-gasly':       'alpine',
+    'franco-colapinto':   'alpine',
+    'yuki-tsunoda':       'racing-bulls',
+    'isack-hadjar':       'racing-bulls',
+    'arvid-lindblad':     'racing-bulls',
+    'esteban-ocon':       'haas',
+    'oliver-bearman':     'haas',
+    'nico-hulkenberg':    'audi',
+    'gabriel-bortoleto':  'audi',
+    'sergio-perez':       'cadillac',
+    'valtteri-bottas':    'cadillac',
 }
 
 _DRIVER_CURRENT_ROUND_FEATURES = [
@@ -127,10 +130,35 @@ class F1FantasyPredictor:
         import joblib
         return joblib.load(path)
 
-    def predict_next(self, df, year, round_num, drivers_predicted_sum_map=None):
+    def predict_next(self, df, year, round_num, drivers_predicted_sum_map=None,
+                     cost_df: pd.DataFrame | None = None):
         current_round = df[(df['year'] == year) & (df['round'] == round_num)].copy()
         if current_round.empty:
-            return pd.DataFrame()
+            # No feature row for this round yet (e.g. pre-practice baseline).
+            # Use the most recent prior round's rolling features as a proxy and
+            # blank out all practice-session columns (fp*_gap_sec, lap_time_*).
+            prior = df[
+                (df['year'] < year) | ((df['year'] == year) & (df['round'] < round_num))
+            ]
+            if prior.empty:
+                return pd.DataFrame()
+            latest_year  = prior['year'].max()
+            latest_round = prior[prior['year'] == latest_year]['round'].max()
+            current_round = prior[
+                (prior['year'] == latest_year) & (prior['round'] == latest_round)
+            ].copy()
+            current_round['year']  = year
+            current_round['round'] = round_num
+            fp_cols = [c for c in current_round.columns
+                       if any(tag in c for tag in ('fp1', 'fp2', 'fp3', 'gap_sec', 'lap_time'))]
+            current_round[fp_cols] = np.nan
+            # Overwrite costs with the caller-supplied cost_df when available
+            if cost_df is not None:
+                id_col = 'driver_id' if self.asset_type == 'driver' else 'constructor_id'
+                cost_map = cost_df.set_index(id_col)['cost'].to_dict()
+                current_round['cost'] = current_round[id_col].map(cost_map)
+            print(f"  ({self.asset_type}) No feature row for {year} R{round_num} — "
+                  f"using {latest_year} R{latest_round} rolling features as baseline.")
         if self.asset_type == 'constructor' and drivers_predicted_sum_map is not None:
             current_round['drivers_predicted_points_sum'] = (
                 current_round['constructor_id'].map(drivers_predicted_sum_map).fillna(0)

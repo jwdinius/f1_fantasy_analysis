@@ -1,6 +1,7 @@
 data/*
 .fastf1/*
 .DS_Store
+.antigravitycli
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

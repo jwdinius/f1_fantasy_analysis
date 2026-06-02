@@ -2,28 +2,31 @@ import pandas as pd
 import itertools
 import sys
 
-# 2025 Canonical Constructor Mapping for the 3-asset rule
+# 2026 Canonical Constructor Mapping for the 3-asset rule
 DRIVER_TO_CONSTRUCTOR = {
-    'lando-norris': 'mclaren',
-    'oscar-piastri': 'mclaren',
-    'max-verstappen': 'red-bull',
-    'liam-lawson': 'red-bull',
-    'george-russell': 'mercedes',
-    'andrea-kimi-antonelli': 'mercedes',
-    'charles-leclerc': 'ferrari',
-    'lewis-hamilton': 'ferrari',
-    'alexander-albon': 'williams',
-    'carlos-sainz-jr': 'williams',
-    'fernando-alonso': 'aston-martin',
-    'lance-stroll': 'aston-martin',
-    'pierre-gasly': 'alpine',
-    'jack-doohan': 'alpine',
-    'yuki-tsunoda': 'racing-bulls',
-    'isack-hadjar': 'racing-bulls',
-    'esteban-ocon': 'haas',
-    'oliver-bearman': 'haas',
-    'nico-hulkenberg': 'kick-sauber',
-    'gabriel-bortoleto': 'kick-sauber'
+    'lando-norris':       'mclaren',
+    'oscar-piastri':      'mclaren',
+    'max-verstappen':     'red-bull',
+    'liam-lawson':        'red-bull',
+    'george-russell':     'mercedes',
+    'kimi-antonelli':     'mercedes',
+    'charles-leclerc':    'ferrari',
+    'lewis-hamilton':     'ferrari',
+    'alexander-albon':    'williams',
+    'carlos-sainz-jr':    'williams',
+    'fernando-alonso':    'aston-martin',
+    'lance-stroll':       'aston-martin',
+    'pierre-gasly':       'alpine',
+    'franco-colapinto':   'alpine',
+    'yuki-tsunoda':       'racing-bulls',
+    'isack-hadjar':       'racing-bulls',
+    'arvid-lindblad':     'racing-bulls',
+    'esteban-ocon':       'haas',
+    'oliver-bearman':     'haas',
+    'nico-hulkenberg':    'audi',
+    'gabriel-bortoleto':  'audi',
+    'sergio-perez':       'cadillac',
+    'valtteri-bottas':    'cadillac',
 }
 
 def solve_knapsack(ev_file, budget=100.0, cost_overrides=None, top_n=1):
