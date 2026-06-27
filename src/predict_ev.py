@@ -61,7 +61,8 @@ def _latest_costs(actual_path: Path, id_col: str) -> pd.DataFrame | None:
     return result
 
 
-def generate_ev_report(year: int | None = None, round_num: int | None = None):
+def generate_ev_report(year: int | None = None, round_num: int | None = None,
+                       from_checkpoint: bool = False):
     d_path = data_dir / "processed_fantasy_drivers.csv"
     c_path = data_dir / "processed_fantasy_constructors.csv"
 
@@ -80,32 +81,46 @@ def generate_ev_report(year: int | None = None, round_num: int | None = None):
     d_cost_df = _latest_costs(data_dir / "actual_fantasy_drivers.csv",     "driver_id")
     c_cost_df = _latest_costs(data_dir / "actual_fantasy_constructors.csv", "constructor_id")
 
-    # 1. Predict Drivers
-    d_train = d_df[
-        (d_df['year'] < year) | ((d_df['year'] == year) & (d_df['round'] < round_num))
-    ]
-    d_predictor = F1FantasyPredictor(asset_type='driver')
-    if not d_train.empty:
-        d_predictor.train(d_train)
+    if from_checkpoint:
+        models_dir = script_dir.parent / "models"
+        d_ckpt = models_dir / "driver_predictor.joblib"
+        c_ckpt = models_dir / "constructor_predictor.joblib"
+        missing = [str(p) for p in (d_ckpt, c_ckpt) if not p.exists()]
+        if missing:
+            raise FileNotFoundError(
+                "Inference requested but checkpoint(s) missing: "
+                + ", ".join(missing)
+                + "\nRun `python -m src.train_model` first."
+            )
+        d_predictor = F1FantasyPredictor.load(d_ckpt)
+        c_predictor = F1FantasyPredictor.load(c_ckpt)
+        print(f"Loaded driver checkpoint     : {d_ckpt}")
+        print(f"Loaded constructor checkpoint: {c_ckpt}")
+    else:
+        d_train = d_df[
+            (d_df['year'] < year) | ((d_df['year'] == year) & (d_df['round'] < round_num))
+        ]
+        d_predictor = F1FantasyPredictor(asset_type='driver')
+        if not d_train.empty:
+            d_predictor.train(d_train)
+
+        c_train = c_df[
+            (c_df['year'] < year) | ((c_df['year'] == year) & (c_df['round'] < round_num))
+        ].copy()
+
+        if 'drivers_predicted_points_sum' not in c_train.columns:
+            actual_sums = (
+                d_df.groupby(['year', 'round', 'constructor_id'])['fantasy_points']
+                .sum().reset_index()
+                .rename(columns={'fantasy_points': 'drivers_predicted_points_sum'})
+            )
+            c_train = pd.merge(c_train, actual_sums, on=['year', 'round', 'constructor_id'], how='left')
+
+        c_predictor = F1FantasyPredictor(asset_type='constructor')
+        if not c_train.empty:
+            c_predictor.train(c_train)
+
     d_preds = d_predictor.predict_next(d_df, year, round_num, cost_df=d_cost_df)
-
-    # 2. Predict Constructors
-    c_train = c_df[
-        (c_df['year'] < year) | ((c_df['year'] == year) & (c_df['round'] < round_num))
-    ].copy()
-
-    if 'drivers_predicted_points_sum' not in c_train.columns:
-        actual_sums = (
-            d_df.groupby(['year', 'round', 'constructor_id'])['fantasy_points']
-            .sum().reset_index()
-            .rename(columns={'fantasy_points': 'drivers_predicted_points_sum'})
-        )
-        c_train = pd.merge(c_train, actual_sums, on=['year', 'round', 'constructor_id'], how='left')
-
-    c_predictor = F1FantasyPredictor(asset_type='constructor')
-    if not c_train.empty:
-        c_predictor.train(c_train)
-
     driver_sums = d_preds.groupby('constructor_id')['predicted_points'].sum().to_dict()
     c_preds = c_predictor.predict_next(
         c_df, year, round_num,
@@ -138,5 +153,7 @@ if __name__ == "__main__":
                         help="Season year (auto-detected if omitted)")
     parser.add_argument("--round", type=int, default=None,
                         help="Round number (auto-detected if omitted)")
+    parser.add_argument("--from-checkpoint", action="store_true",
+                        help="Load models/{driver,constructor}_predictor.joblib instead of training in-line")
     args = parser.parse_args()
-    generate_ev_report(args.year, args.round)
+    generate_ev_report(args.year, args.round, from_checkpoint=args.from_checkpoint)

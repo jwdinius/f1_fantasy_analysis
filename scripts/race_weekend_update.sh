@@ -1,5 +1,5 @@
 #!/bin/bash
-# Usage: ./scripts/race_weekend_update.sh [--top-n N] [--budget B] [--year Y --round R]
+# Usage: ./scripts/race_weekend_update.sh [--top-n N] [--budget B] [--year Y --round R] [--inference]
 #
 # Run after Friday FP3. Updates the f1db submodule, rebuilds the database,
 # reprocesses all data, generates driver/constructor EV predictions for the
@@ -14,6 +14,12 @@
 # with FP feature data but no race result yet is the target. Pass --year and
 # --round to override if needed.
 #
+# --inference: fast path that only refreshes costs/points from the Numbers
+# spreadsheets and predicts using the saved model checkpoint in models/.
+# Skips the f1db submodule update, Docker rebuild, and data_processing.
+# Requires models/{driver,constructor}_predictor.joblib (run
+# `python -m src.train_model` first if missing).
+#
 # Requires the f1_fantasy conda environment (environment.yml).
 
 set -euo pipefail
@@ -23,13 +29,15 @@ TOP_N=3
 BUDGET=100.0
 YEAR=""
 ROUND=""
+INFERENCE=0
 
 while [[ "$#" -gt 0 ]]; do
     case "$1" in
-        --top-n)  TOP_N="$2";   shift 2 ;;
-        --budget) BUDGET="$2";  shift 2 ;;
-        --year)   YEAR="$2";    shift 2 ;;
-        --round)  ROUND="$2";   shift 2 ;;
+        --top-n)     TOP_N="$2";   shift 2 ;;
+        --budget)    BUDGET="$2";  shift 2 ;;
+        --year)      YEAR="$2";    shift 2 ;;
+        --round)     ROUND="$2";   shift 2 ;;
+        --inference) INFERENCE=1;  shift   ;;
         *) echo "Unknown flag: $1"; exit 1 ;;
     esac
 done
@@ -37,49 +45,60 @@ done
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 
+if [[ "$INFERENCE" -eq 1 ]]; then
+    STEPS=2
+else
+    STEPS=5
+fi
+
 # ---------------------------------------------------------------------------
 # Step 1 — convert Numbers spreadsheets → actual_fantasy_*.csv
 # ---------------------------------------------------------------------------
 echo ""
-echo "=== [1/5] Converting Numbers spreadsheets ==="
+echo "=== [1/${STEPS}] Converting Numbers spreadsheets ==="
 conda run --no-capture-output -n "$CONDA_ENV" \
     python -m src.convert_numbers
 
-# ---------------------------------------------------------------------------
-# Step 2 — update f1db submodule
-# ---------------------------------------------------------------------------
-echo ""
-echo "=== [2/5] Updating f1db submodule ==="
-git -C f1db fetch upstream && \
-    git -C f1db checkout add-docker && \
-    git -C f1db rebase upstream/main && \
-    git -C f1db push origin add-docker -f
+if [[ "$INFERENCE" -eq 0 ]]; then
+    # -----------------------------------------------------------------------
+    # Step 2 — update f1db submodule
+    # -----------------------------------------------------------------------
+    echo ""
+    echo "=== [2/5] Updating f1db submodule ==="
+    git -C f1db fetch upstream && \
+        git -C f1db checkout add-docker && \
+        git -C f1db rebase upstream/main && \
+        git -C f1db push origin add-docker -f
+
+    # -----------------------------------------------------------------------
+    # Step 3 — rebuild f1db Docker image and copy artifacts
+    # -----------------------------------------------------------------------
+    echo ""
+    echo "=== [3/5] Building f1db Docker image ==="
+    ./scripts/build_f1db
+
+    # -----------------------------------------------------------------------
+    # Step 4 — rebuild processed feature CSVs
+    # -----------------------------------------------------------------------
+    echo ""
+    echo "=== [4/5] Rebuilding processed data ==="
+    conda run --no-capture-output -n "$CONDA_ENV" \
+        python -m src.data_processing
+fi
 
 # ---------------------------------------------------------------------------
-# Step 3 — rebuild f1db Docker image and copy artifacts
+# Final step — generate EV predictions + optimize team
 # ---------------------------------------------------------------------------
 echo ""
-echo "=== [3/5] Building f1db Docker image ==="
-./scripts/build_f1db
-
-# ---------------------------------------------------------------------------
-# Step 4 — rebuild processed feature CSVs
-# ---------------------------------------------------------------------------
-echo ""
-echo "=== [4/5] Rebuilding processed data ==="
-conda run --no-capture-output -n "$CONDA_ENV" \
-    python -m src.data_processing
-
-# ---------------------------------------------------------------------------
-# Step 5 — generate EV predictions + optimize team
-# ---------------------------------------------------------------------------
-echo ""
-echo "=== [5/5] Generating EV predictions and optimising team ==="
+echo "=== [${STEPS}/${STEPS}] Generating EV predictions and optimising team ==="
 mkdir -p "$PROJECT_ROOT/data/ev_reports"
 
 PREDICT_ARGS=""
 if [[ -n "$YEAR" && -n "$ROUND" ]]; then
     PREDICT_ARGS="--year $YEAR --round $ROUND"
+fi
+if [[ "$INFERENCE" -eq 1 ]]; then
+    PREDICT_ARGS="$PREDICT_ARGS --from-checkpoint"
 fi
 
 # predict_ev prints the target round and saves the EV report; capture the path
