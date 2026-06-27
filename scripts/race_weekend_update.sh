@@ -31,6 +31,32 @@ YEAR=""
 ROUND=""
 INFERENCE=0
 
+usage() {
+    cat <<'EOF'
+Usage: ./scripts/race_weekend_update.sh [OPTIONS]
+
+Run after Friday FP3 to update data, generate EV predictions for the current
+round, and print the optimal fantasy team.
+
+Options:
+  --top-n N        Number of top teams to display (default: 3)
+  --budget B       Budget cap in $M (default: 100.0)
+  --year Y         Override auto-detected year (must be used with --round)
+  --round R        Override auto-detected round (must be used with --year)
+  --inference      Fast path: skip f1db update, Docker rebuild, and data
+                   processing. Only refreshes costs/points from the Numbers
+                   spreadsheets and predicts from the saved model checkpoint.
+                   Requires models/{driver,constructor}_predictor.joblib.
+  -h, --help       Show this help message and exit
+
+Prerequisite: update the four Numbers spreadsheets in data/numbers/
+(Drivers-Cost, Drivers-Points, Teams-Cost, Teams-Points) with the current
+round's costs and any new Game Score data before running.
+
+Requires the f1_fantasy conda environment (environment.yml).
+EOF
+}
+
 while [[ "$#" -gt 0 ]]; do
     case "$1" in
         --top-n)     TOP_N="$2";   shift 2 ;;
@@ -38,7 +64,8 @@ while [[ "$#" -gt 0 ]]; do
         --year)      YEAR="$2";    shift 2 ;;
         --round)     ROUND="$2";   shift 2 ;;
         --inference) INFERENCE=1;  shift   ;;
-        *) echo "Unknown flag: $1"; exit 1 ;;
+        -h|--help)   usage; exit 0 ;;
+        *) echo "Unknown flag: $1" >&2; usage >&2; exit 1 ;;
     esac
 done
 
