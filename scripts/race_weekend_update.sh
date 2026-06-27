@@ -25,7 +25,7 @@
 set -euo pipefail
 
 CONDA_ENV=f1_fantasy
-TOP_N=3
+TOP_N=""
 BUDGET=100.0
 YEAR=""
 ROUND=""
@@ -39,7 +39,9 @@ Run after Friday FP3 to update data, generate EV predictions for the current
 round, and print the optimal fantasy team.
 
 Options:
-  --top-n N        Number of top teams to display (default: 3)
+  --top-n N        Flat top-N ranking instead of the default hedge slate.
+                   The default output is a 2-3 row slate (Headline + hedges
+                   against tail risk on the top-2 EV drivers in Headline).
   --budget B       Budget cap in $M (default: 100.0)
   --year Y         Override auto-detected year (must be used with --round)
   --round R        Override auto-detected round (must be used with --year)
@@ -139,10 +141,18 @@ if [[ -z "$EV_REPORT" ]]; then
     exit 1
 fi
 
+if [[ -n "$TOP_N" ]]; then
+    OPT_FLAGS=(--hedge none --top-n "$TOP_N")
+    MODE_LABEL="top ${TOP_N}"
+else
+    OPT_FLAGS=(--hedge anchor)
+    MODE_LABEL="hedge slate"
+fi
+
 echo ""
-echo "=== Optimising team (top ${TOP_N}, budget \$${BUDGET}M) ==="
+echo "=== Optimising team (${MODE_LABEL}, budget \$${BUDGET}M) ==="
 conda run --no-capture-output -n "$CONDA_ENV" \
-    python src/optimize_lp.py "$EV_REPORT" "$BUDGET" --top-n "$TOP_N"
+    python src/optimize_lp.py "$EV_REPORT" "$BUDGET" "${OPT_FLAGS[@]}"
 
 echo ""
 echo "Done. EV report: $EV_REPORT"
